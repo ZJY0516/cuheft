@@ -17,7 +17,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,7 +39,7 @@ jobs:
       CUHEFT_REQUIRE_CUDA: 1
       CUDA_VERSION: "13-1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install nvcc and cuobjdump
         # Only the two components from NVIDIA's apt repository, not the whole
         # toolkit. Works on both x86_64 and arm64 (sbsa) runners.
