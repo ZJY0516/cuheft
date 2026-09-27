@@ -27,6 +27,7 @@ cuheft libfoo.so                 # top 30 kernels
 cuheft libfoo.so -n 100          # top 100
 cuheft libfoo.so -a sm_90a       # one architecture only
 cuheft libfoo.so -r 'gemm|attn'  # regex on kernel names, case-insensitive
+cuheft libfoo.so -g template     # add up the instantiations of each template
 cuheft foo.sm_100f.cubin         # also .o and .a files
 cuheft libfoo.so --full-names    # do not shorten kernel names
 cuheft libfoo.so -f json | jq '.kernels[:5]'
@@ -111,6 +112,29 @@ kernel also uses every register it is allowed (the `__launch_bounds__` or
 record actual spill counts, so check those with `ptxas -v` or Nsight
 Compute. JSON output lists every kernel with its size and resources per
 architecture.
+
+Template instantiations are often what makes a library big, and they are
+hard to see one kernel at a time. `-g template` folds every template
+argument list into `<…>`, drops the parameters and adds up what remains:
+
+```
+Top templates (5 of 33)
+╭─────┬────────────────────────────────────────┬─────────┬───────┬───────────┬───────────╮
+│   # ┆ Template                               ┆ Kernels ┆ Archs ┆      Size ┆ % of code │
+╞═════╪════════════════════════════════════════╪═════════╪═══════╪═══════════╪═══════════╡
+│   1 ┆ marlin_moe_wna16::Marlin<…>            ┆     876 ┆     3 ┆ 133.8 MiB ┆     38.4% │
+│   2 ┆ vllm::moe::topkGatingSoftplusSqrt<…>   ┆     630 ┆     7 ┆  89.4 MiB ┆     25.7% │
+│   3 ┆ vllm::moe::single_group_topk::detail:… ┆     189 ┆     7 ┆  43.8 MiB ┆     12.6% │
+│   4 ┆ vllm::moe::single_group_topk::detail:… ┆     189 ┆     7 ┆  31.3 MiB ┆      9.0% │
+│   5 ┆ vllm::moe::topkGating<…>               ┆     270 ┆     7 ┆  25.5 MiB ┆      7.3% │
+│ ... ┆ (28 more templates)                    ┆         ┆       ┆           ┆           │
+╰─────┴────────────────────────────────────────┴─────────┴───────┴───────────┴───────────╯
+```
+
+The Kernels column counts the instantiations. Resource columns show the
+largest value in the group, and the stack is highlighted if any kernel in it
+likely spills. `--filter` still matches full kernel names, so
+`-g template -r '<float'` adds up only the `float` instantiations.
 
 With `--device`, each kernel is checked against CUDA's loading rules: a cubin
 runs on the same major version with an equal or newer minor (`sm_100` and

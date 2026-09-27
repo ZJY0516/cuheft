@@ -308,6 +308,35 @@ fn sort_by_stack_surfaces_local_memory() {
 }
 
 #[test]
+fn group_by_template() {
+    let Some(fx) = fixtures() else { return };
+    let json = cuheft_json(&fx.sm90a_cubin, &["--group", "template"]);
+    assert_eq!(json["group_by"], "template");
+    assert_eq!(json["kernel_count"], 4);
+    assert_eq!(
+        strings(&json, "kernels", "name"),
+        ["local_array_kernel", "plain_c_kernel", "scale_kernel<…>"]
+    );
+    let scale = kernel(&json, "scale_kernel");
+    assert_eq!(scale["instances"], 2);
+    assert_eq!(scale["by_arch"]["sm_90a"]["instances"], 2);
+
+    // --filter still sees the template arguments
+    let json = cuheft_json(&fx.sm90a_cubin, &["-g", "template", "-r", "<8192>"]);
+    assert_eq!(kernel(&json, "scale_kernel")["instances"], 1);
+
+    let output = cuheft(&[
+        fx.sm90a_cubin.to_str().unwrap(),
+        "-g",
+        "template",
+        "--color",
+        "never",
+    ]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Top templates (3 of 3)"), "{stdout}");
+}
+
+#[test]
 fn device_availability() {
     let Some(fx) = fixtures() else { return };
     if !tool_available("cuobjdump") {

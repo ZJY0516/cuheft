@@ -1,6 +1,6 @@
 //! Aggregation of per-cubin results and rendering.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 
 use bytesize::ByteSize;
@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::availability::{DeviceReport, Status};
 use crate::cubin::{CubinInfo, KernelInfo, Sections, Usage};
+use crate::demangle;
 
 /// Kernels listed in each per-architecture table.
 const PER_ARCH_TOP: usize = 15;
@@ -30,18 +31,25 @@ pub struct ArchSummary {
     pub total: u64,
 }
 
-/// A kernel's code size and resources on one architecture.
+/// Code size and resources of a kernel, or of all kernels in a group, on
+/// one architecture.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArchStats {
     pub size: u64,
+    /// The largest value of each resource.
     pub usage: Usage,
+    /// Distinct kernels merged into this entry.
+    pub instances: usize,
+    /// Any of them likely spills; not derivable from the merged `usage`.
+    pub likely_spill: bool,
 }
 
 impl ArchStats {
-    /// Merge another copy of the kernel, e.g. from a second cubin of the
-    /// same architecture: sizes add up, resources take the larger value.
+    /// Merge in a kernel of the group, or another copy of the same kernel
+    /// from a second cubin: sizes add up, resources take the larger value.
     fn add(&mut self, kernel: &KernelInfo) {
         self.size += kernel.size;
+        self.likely_spill |= kernel.usage.likely_spills();
         let (u, k) = (&mut self.usage, kernel.usage);
         u.registers = u.registers.max(k.registers);
         u.max_registers = u.max_registers.max(k.max_registers);
@@ -50,12 +58,48 @@ impl ArchStats {
     }
 }
 
+/// A row of the kernel lists: one kernel, or all instances of a template.
 #[derive(Debug)]
 pub struct Kernel {
     pub name: String,
     /// Code bytes summed over all architectures.
     pub size: u64,
+    /// Distinct kernels in this entry.
+    pub instances: usize,
     pub by_arch: BTreeMap<String, ArchStats>,
+}
+
+/// What each row of the kernel lists stands for.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Group {
+    /// One row per kernel
+    #[default]
+    Kernel,
+    /// One row per template, adding up its instantiations
+    Template,
+}
+
+impl Group {
+    fn key(self, name: &str) -> String {
+        match self {
+            Self::Kernel => name.to_string(),
+            Self::Template => demangle::template_name(name),
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Kernel => "kernel",
+            Self::Template => "template",
+        }
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Self::Kernel => "Kernel",
+            Self::Template => "Template",
+        }
+    }
 }
 
 /// What kernel lists are ordered by, largest first.
@@ -100,6 +144,7 @@ pub struct Report {
     pub archs: Vec<ArchSummary>,
     /// Ordered by `sort`, largest first.
     pub kernels: Vec<Kernel>,
+    pub group: Group,
     /// Non-kernel functions, summed over cubins; not name-filtered.
     pub device_functions: usize,
     pub device_code: u64,
@@ -116,10 +161,13 @@ impl Report {
         arch: Option<&str>,
         name_filter: Option<&Regex>,
         sort: SortKey,
+        group: Group,
     ) -> Self {
         let mut sections = Sections::default();
         let mut arch_sections: BTreeMap<&str, Sections> = BTreeMap::new();
-        let mut kernels: HashMap<&str, BTreeMap<String, ArchStats>> = HashMap::new();
+        let mut kernels: HashMap<String, BTreeMap<String, ArchStats>> = HashMap::new();
+        let mut instances: HashMap<String, HashSet<&str>> = HashMap::new();
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
         let (mut device_functions, mut device_code) = (0, 0);
 
         for cubin in cubins {
@@ -131,27 +179,32 @@ impl Report {
             device_code += cubin.device_code;
             *arch_sections.entry(&cubin.arch).or_default() += &cubin.sections;
             for kernel in &cubin.kernels {
-                if name_filter.is_none_or(|re| re.is_match(&kernel.name)) {
-                    kernels
-                        .entry(&kernel.name)
-                        .or_default()
-                        .entry(cubin.arch.clone())
-                        .or_default()
-                        .add(kernel);
+                if name_filter.is_some_and(|re| !re.is_match(&kernel.name)) {
+                    continue;
                 }
+                let key = group.key(&kernel.name);
+                let stats = kernels
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(cubin.arch.clone())
+                    .or_default();
+                // The same kernel can come from several cubins of one arch
+                if seen.insert((&cubin.arch, &kernel.name)) {
+                    stats.instances += 1;
+                }
+                stats.add(kernel);
+                instances.entry(key).or_default().insert(&kernel.name);
             }
         }
 
         let archs = arch_sections
             .into_iter()
             .map(|(arch, secs)| {
-                let sizes = kernels
-                    .values()
-                    .filter_map(|by_arch| Some(by_arch.get(arch)?.size));
+                let stats = kernels.values().filter_map(|by_arch| by_arch.get(arch));
                 ArchSummary {
                     arch: arch.to_string(),
-                    kernels: sizes.clone().count(),
-                    code: sizes.sum(),
+                    kernels: stats.clone().map(|s| s.instances).sum(),
+                    code: stats.map(|s| s.size).sum(),
                     total: secs.total(),
                 }
             })
@@ -160,8 +213,9 @@ impl Report {
         let mut kernels: Vec<Kernel> = kernels
             .into_iter()
             .map(|(name, by_arch)| Kernel {
-                name: name.to_string(),
                 size: by_arch.values().map(|s| s.size).sum(),
+                instances: instances[&name].len(),
+                name,
                 by_arch,
             })
             .collect();
@@ -176,6 +230,7 @@ impl Report {
             sections,
             archs,
             kernels,
+            group,
             device_functions,
             device_code,
             sort,
@@ -187,6 +242,16 @@ impl Report {
         self.kernels.iter().map(|k| k.size).sum()
     }
 
+    /// Distinct kernels over all rows.
+    fn kernel_count(&self) -> usize {
+        self.kernels.iter().map(|k| k.instances).sum()
+    }
+
+    /// Instance counts are only worth showing when rows are groups.
+    fn instances(&self, count: usize) -> Option<usize> {
+        (self.group != Group::Kernel).then_some(count)
+    }
+
     pub fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
         let total = self.sections.total();
         let kernel_code = self.kernel_code();
@@ -196,7 +261,8 @@ impl Report {
             total_size_human: human_size(total),
             kernel_code_size: kernel_code,
             kernel_code_size_human: human_size(kernel_code),
-            kernel_count: self.kernels.len(),
+            kernel_count: self.kernel_count(),
+            group_by: self.group.noun(),
             device_function_count: self.device_functions,
             device_function_code_size: self.device_code,
             device_function_code_size_human: human_size(self.device_code),
@@ -229,6 +295,7 @@ impl Report {
                 .iter()
                 .map(|k| JsonKernel {
                     name: &k.name,
+                    instances: self.instances(k.instances),
                     size: k.size,
                     size_human: human_size(k.size),
                     percent: json_percent(k.size, kernel_code),
@@ -237,12 +304,13 @@ impl Report {
                         .iter()
                         .map(|(arch, stats)| {
                             let json = JsonArchStats {
+                                instances: self.instances(stats.instances),
                                 size: stats.size,
                                 size_human: human_size(stats.size),
                                 registers: stats.usage.registers,
                                 max_registers: stats.usage.max_registers,
                                 stack: stats.usage.stack,
-                                likely_spill: stats.usage.likely_spills(),
+                                likely_spill: stats.likely_spill,
                                 static_shared: stats.usage.shared,
                             };
                             (arch.as_str(), json)
@@ -300,7 +368,7 @@ impl Report {
         table.add_row(
             [
                 "TOTAL".to_string(),
-                self.kernels.len().to_string(),
+                self.kernel_count().to_string(),
                 human_size(kernel_code),
                 human_size(total),
                 format_percent(total, total),
@@ -338,13 +406,15 @@ impl Report {
             .map(|k| KernelRow {
                 name: &k.name,
                 size: k.size,
+                instances: self.instances(k.instances),
                 archs: (!single_arch).then_some(k.by_arch.len()),
-                usage: single_arch.then(|| k.by_arch.values().next().unwrap().usage),
+                stats: single_arch.then(|| *k.by_arch.values().next().unwrap()),
             })
             .collect();
+        let noun = self.group.noun();
         let shown = top.min(rows.len());
-        let heading = format!("Top kernels ({shown} of {})", rows.len());
-        let table = kernel_table(layout, &rows, shown, kernel_code);
+        let heading = format!("Top {noun}s ({shown} of {})", rows.len());
+        let table = kernel_table(layout, self.group, &rows, shown, kernel_code);
         writeln!(out, "{}\n{table}", layout.title(&heading))?;
 
         if self.archs.len() > 1 {
@@ -356,22 +426,20 @@ impl Report {
                     .map(|(name, stats)| KernelRow {
                         name,
                         size: stats.size,
+                        instances: self.instances(stats.instances),
                         archs: None,
-                        usage: Some(stats.usage),
+                        stats: Some(stats),
                     })
                     .collect();
-                // Kernels are ranked across architectures; re-rank for this one
+                // Rows are ranked across architectures; re-rank for this one
                 let key = |r: &KernelRow| {
-                    let stats = ArchStats {
-                        size: r.size,
-                        usage: r.usage.unwrap_or_default(),
-                    };
+                    let stats = r.stats.unwrap_or_default();
                     (self.sort.of(&stats), r.size)
                 };
                 rows.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(b.name)));
                 let shown = PER_ARCH_TOP.min(rows.len());
-                let heading = format!("Top kernels for {} ({shown} of {})", arch.arch, rows.len());
-                let table = kernel_table(layout, &rows, shown, arch.code);
+                let heading = format!("Top {noun}s for {} ({shown} of {})", arch.arch, rows.len());
+                let table = kernel_table(layout, self.group, &rows, shown, arch.code);
                 writeln!(out, "\n{}\n{table}", layout.title(&heading))?;
             }
         }
@@ -421,7 +489,7 @@ fn write_device(
         let name = name_cell(layout.name(name));
         table.add_row(one_line_row(vec![status, name, size_cell(*size)]));
     }
-    add_overflow_row(&mut table, device.problems.len() - shown);
+    add_overflow_row(&mut table, "kernel", device.problems.len() - shown);
     writeln!(out, "{table}")
 }
 
@@ -478,17 +546,29 @@ impl Layout {
 struct KernelRow<'a> {
     name: &'a str,
     size: u64,
+    /// Kernels in the row, shown only when grouped.
+    instances: Option<usize>,
     /// Number of architectures, shown only in the cross-arch table.
     archs: Option<usize>,
     /// Resources, shown only in per-architecture tables.
-    usage: Option<Usage>,
+    stats: Option<ArchStats>,
 }
 
 /// Table of the first `shown` rows, with sizes as a share of `whole`.
-fn kernel_table(layout: Layout, rows: &[KernelRow], shown: usize, whole: u64) -> Table {
+fn kernel_table(
+    layout: Layout,
+    group: Group,
+    rows: &[KernelRow],
+    shown: usize,
+    whole: u64,
+) -> Table {
+    let show_instances = rows.iter().any(|r| r.instances.is_some());
     let show_archs = rows.iter().any(|r| r.archs.is_some());
-    let show_usage = rows.iter().any(|r| r.usage.is_some());
-    let mut columns = vec![Num("#"), Label("Kernel")];
+    let show_usage = rows.iter().any(|r| r.stats.is_some());
+    let mut columns = vec![Num("#"), Label(group.header())];
+    if show_instances {
+        columns.push(Num("Kernels"));
+    }
     if show_archs {
         columns.push(Num("Archs"));
     }
@@ -504,14 +584,15 @@ fn kernel_table(layout: Layout, rows: &[KernelRow], shown: usize, whole: u64) ->
             Cell::new(rank + 1).add_attribute(Attribute::Dim),
             name_cell(layout.name(row.name)),
         ];
+        cells.extend(row.instances.map(count_cell));
         cells.extend(row.archs.map(count_cell));
         cells.extend([size_cell(row.size), percent_cell(row.size, whole)]);
-        if let Some(usage) = row.usage {
-            cells.extend(usage_cells(usage));
+        if let Some(stats) = row.stats {
+            cells.extend(usage_cells(stats));
         }
         table.add_row(one_line_row(cells));
     }
-    add_overflow_row(&mut table, rows.len() - shown);
+    add_overflow_row(&mut table, group.noun(), rows.len() - shown);
     table
 }
 
@@ -521,12 +602,12 @@ fn one_line_row(cells: Vec<Cell>) -> Row {
     row
 }
 
-/// Note the kernels left out of a table, if any.
-fn add_overflow_row(table: &mut Table, hidden: usize) {
+/// Note the rows left out of a table, if any.
+fn add_overflow_row(table: &mut Table, noun: &str, hidden: usize) {
     if hidden > 0 {
         table.add_row(vec![
             Cell::new("..."),
-            Cell::new(format!("({hidden} more kernels)")).add_attribute(Attribute::Dim),
+            Cell::new(format!("({hidden} more {noun}s)")).add_attribute(Attribute::Dim),
         ]);
     }
 }
@@ -585,11 +666,12 @@ fn size_cell(bytes: u64) -> Cell {
 }
 
 /// Registers, stack and static shared memory. The stack is highlighted when
-/// the kernel most likely spills, i.e. its registers are at the limit.
-fn usage_cells(usage: Usage) -> [Cell; 3] {
+/// a kernel most likely spills, i.e. its registers are at the limit.
+fn usage_cells(stats: ArchStats) -> [Cell; 3] {
+    let usage = stats.usage;
     let optional = |value: Option<String>| value.unwrap_or_else(|| "-".into());
     let stack = Cell::new(optional(usage.stack.map(|b| human_size(b.into()))));
-    let stack = if usage.likely_spills() {
+    let stack = if stats.likely_spill {
         stack.fg(Color::DarkRed).add_attribute(Attribute::Bold)
     } else {
         stack
@@ -613,6 +695,8 @@ struct JsonReport<'a> {
     kernel_code_size: u64,
     kernel_code_size_human: String,
     kernel_count: usize,
+    /// What each entry of `kernels` stands for: `kernel` or `template`.
+    group_by: &'static str,
     /// Functions that are not kernels, e.g. device functions in -rdc builds.
     device_function_count: usize,
     device_function_code_size: u64,
@@ -658,6 +742,9 @@ struct JsonSection {
 #[derive(Serialize)]
 struct JsonKernel<'a> {
     name: &'a str,
+    /// Kernels in the template, when grouped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<usize>,
     size: u64,
     size_human: String,
     /// Share of all kernel code.
@@ -667,15 +754,19 @@ struct JsonKernel<'a> {
 
 #[derive(Serialize)]
 struct JsonArchStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<usize>,
     size: u64,
     size_human: String,
-    /// Per thread.
+    /// Per thread; the largest in the group when grouped, as for the
+    /// other resources.
     registers: Option<u32>,
     /// Per-thread register limit set at compile time.
     max_registers: Option<u32>,
     /// Local memory per thread, in bytes: spills, local arrays or calls.
     stack: Option<u32>,
-    /// Registers at the limit with a non-zero stack.
+    /// Registers at the limit with a non-zero stack, for any kernel of
+    /// the group.
     likely_spill: bool,
     /// Shared memory per block allocated at compile time, in bytes,
     /// including any system reservation; excludes dynamic shared memory.
@@ -744,7 +835,14 @@ mod tests {
 
     #[test]
     fn merges_kernels_across_archs() {
-        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
+        let report = Report::build(
+            "lib.so".into(),
+            &sample(),
+            None,
+            None,
+            SortKey::Size,
+            Group::Kernel,
+        );
         let names: Vec<_> = report
             .kernels
             .iter()
@@ -769,6 +867,7 @@ mod tests {
             Some("sm_100"),
             Some(&re),
             SortKey::Size,
+            Group::Kernel,
         );
         assert_eq!(report.kernels.len(), 1);
         assert_eq!(report.kernels[0].size, 200);
@@ -778,8 +877,53 @@ mod tests {
     }
 
     #[test]
+    fn groups_template_instances() {
+        let spilling = KernelInfo {
+            name: "gemm<2>(float*)".into(),
+            size: 100,
+            usage: Usage {
+                registers: Some(255),
+                stack: Some(16),
+                ..Usage::default()
+            },
+        };
+        let mut cubins = vec![
+            cubin("sm_90a", &[("gemm<1>(float*)", 300), ("norm", 50)], 350),
+            // The same instance again from a second cubin
+            cubin("sm_90a", &[("gemm<1>(float*)", 30)], 30),
+            cubin("sm_100", &[("gemm<1>(float*)", 200)], 200),
+        ];
+        cubins[0].kernels.push(spilling);
+        let report = Report::build(
+            "lib.so".into(),
+            &cubins,
+            None,
+            None,
+            SortKey::Size,
+            Group::Template,
+        );
+        let gemm = &report.kernels[0];
+        assert_eq!((gemm.name.as_str(), gemm.size), ("gemm<…>", 630));
+        assert_eq!(gemm.instances, 2);
+        let sm90 = &gemm.by_arch["sm_90a"];
+        assert_eq!((sm90.instances, sm90.size), (2, 430));
+        assert!(sm90.likely_spill);
+        assert!(!gemm.by_arch["sm_100"].likely_spill);
+        assert_eq!(report.kernel_count(), 3);
+        let kernels: Vec<_> = report.archs.iter().map(|a| a.kernels).collect();
+        assert_eq!(kernels, [1, 3]);
+    }
+
+    #[test]
     fn json_has_raw_and_human_sizes() {
-        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
+        let report = Report::build(
+            "lib.so".into(),
+            &sample(),
+            None,
+            None,
+            SortKey::Size,
+            Group::Kernel,
+        );
         let mut buf = Vec::new();
         report.write_json(&mut buf).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -793,7 +937,14 @@ mod tests {
 
     #[test]
     fn tables_render_per_arch_breakdown() {
-        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
+        let report = Report::build(
+            "lib.so".into(),
+            &sample(),
+            None,
+            None,
+            SortKey::Size,
+            Group::Kernel,
+        );
         let layout = Layout {
             color: false,
             full_names: false,

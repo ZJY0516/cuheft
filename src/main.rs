@@ -18,7 +18,7 @@ use regex::RegexBuilder;
 use crate::availability::Device;
 use crate::cubin::CubinInfo;
 use crate::ptx::PtxInfo;
-use crate::report::{Layout, Report, SortKey};
+use crate::report::{Group, Layout, Report, SortKey};
 
 /// Size profiler for CUDA binaries: per-kernel code size by SM architecture.
 #[derive(Parser)]
@@ -48,6 +48,11 @@ struct Cli {
     /// Order kernel lists by code size, registers or stack per thread
     #[arg(short, long, value_enum, default_value_t = SortKey::Size)]
     sort: SortKey,
+
+    /// List kernels one by one, or add up the instantiations of each
+    /// template. --filter still matches full kernel names
+    #[arg(short, long, value_enum, default_value_t = Group::Kernel)]
+    group: Group,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
@@ -154,6 +159,7 @@ fn run(cli: &Cli) -> Result<()> {
         cli.arch.as_deref(),
         name_filter.as_ref(),
         cli.sort,
+        cli.group,
     );
     report.devices = availability::check(&cli.device, &cubins, &ptx, name_filter.as_ref());
     let mut out = io::stdout().lock();
