@@ -8,8 +8,7 @@ It also catches build problems that are easy to miss: kernels a given GPU
 cannot load (a `sm_100a`-only kernel on a GB300, say), kernels that are only
 JIT-compiled from PTX at startup, and kernels that likely spill registers.
 
-Rust port of [cubloaty](https://github.com/flashinfer-ai/cubloaty), about 10x
-faster on large libraries.
+Inspired by [cubloaty](https://github.com/flashinfer-ai/cubloaty).
 
 ## Install
 
@@ -116,3 +115,7 @@ cargo test
 The end-to-end tests compile `tests/fixtures/kernels.cu` with nvcc and are
 skipped when nvcc or cuobjdump is missing. Set `CUHEFT_REQUIRE_CUDA=1` to
 make that an error instead, as CI does.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).

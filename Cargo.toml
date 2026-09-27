@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.88"
 description = "Per-kernel, per-architecture size profiler for CUDA binaries"
 readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/ZJY0516/cuheft"
 keywords = ["cuda", "cubin", "bloat", "size", "profiler"]
 categories = ["command-line-utilities", "development-tools"]
 
