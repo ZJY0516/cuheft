@@ -9,46 +9,85 @@ use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ReadCache};
 use tempfile::TempDir;
 
-/// Cubins to analyze. Extracted cubins live in a temporary directory that is
-/// removed when this is dropped.
-pub struct Cubins {
-    pub paths: Vec<PathBuf>,
+/// Device code to analyze. Extracted files live in a temporary directory
+/// that is removed when this is dropped.
+pub struct DeviceCode {
+    pub cubins: Vec<PathBuf>,
+    pub ptx: Vec<PathBuf>,
     _tmpdir: Option<TempDir>,
 }
 
-/// Collect cubins from a standalone cubin or a library with fatbin sections.
-pub fn collect(file: &Path) -> Result<Cubins> {
-    if is_cubin(file).with_context(|| format!("reading {}", file.display()))? {
-        return Ok(Cubins {
-            paths: vec![file.to_path_buf()],
+/// Collect cubins, and PTX if requested, from a standalone cubin, an object
+/// file or library with fatbin sections, or a static archive of those.
+pub fn collect(file: &Path, with_ptx: bool) -> Result<DeviceCode> {
+    let format = detect(file).with_context(|| format!("reading {}", file.display()))?;
+    if format == Format::Cubin {
+        return Ok(DeviceCode {
+            cubins: vec![file.to_path_buf()],
+            ptx: Vec::new(),
             _tmpdir: None,
         });
     }
-    if !has_fatbin_sections(file)? {
+    // Members of an archive are not checked up front; cuobjdump reads them
+    if format == Format::Other && !has_fatbin_sections(file)? {
         bail!("no CUDA fatbin sections found in {}", file.display());
     }
     let tmpdir = tempfile::tempdir()?;
-    let paths = extract_cubins(file, tmpdir.path())?;
-    log::debug!("extracted {} cubin(s) from {}", paths.len(), file.display());
-    if paths.is_empty() {
-        bail!("{} contains no cubins (PTX only?)", file.display());
+    let cubins = extract(file, Kind::Elf, &tmpdir.path().join("cubin"))?;
+    log::debug!(
+        "extracted {} cubin(s) from {}",
+        cubins.len(),
+        file.display()
+    );
+    let ptx = if with_ptx {
+        let ptx = extract(file, Kind::Ptx, &tmpdir.path().join("ptx"))?;
+        log::debug!("extracted {} PTX file(s)", ptx.len());
+        ptx
+    } else {
+        Vec::new()
+    };
+    if cubins.is_empty() && ptx.is_empty() {
+        bail!("{} contains no cubins", file.display());
     }
-    Ok(Cubins {
-        paths,
+    Ok(DeviceCode {
+        cubins,
+        ptx,
         _tmpdir: Some(tmpdir),
     })
 }
 
-/// Whether the file is an ELF for the CUDA machine (EM_CUDA = 190).
-fn is_cubin(path: &Path) -> io::Result<bool> {
+#[derive(Clone, Copy)]
+enum Kind {
+    Elf,
+    Ptx,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Format {
+    /// An ELF for the CUDA machine (EM_CUDA = 190).
+    Cubin,
+    /// A static library (`ar` archive).
+    Archive,
+    Other,
+}
+
+fn detect(path: &Path) -> io::Result<Format> {
     const EM_CUDA: u16 = 190;
     let mut header = [0u8; 20];
     match File::open(path)?.read_exact(&mut header) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Format::Other),
         Err(e) => return Err(e),
     }
-    Ok(header.starts_with(b"\x7fELF") && u16::from_le_bytes([header[18], header[19]]) == EM_CUDA)
+    Ok(if header.starts_with(b"!<arch>\n") {
+        Format::Archive
+    } else if header.starts_with(b"\x7fELF")
+        && u16::from_le_bytes([header[18], header[19]]) == EM_CUDA
+    {
+        Format::Cubin
+    } else {
+        Format::Other
+    })
 }
 
 /// Whether an object file contains any CUDA fatbin section.
@@ -63,14 +102,19 @@ fn has_fatbin_sections(path: &Path) -> Result<bool> {
         .any(|s| s.name().is_ok_and(|n| n.contains("nv_fatbin"))))
 }
 
-/// Extract every embedded cubin into `out_dir` with cuobjdump.
+/// Extract every embedded cubin or PTX file into `out_dir` with cuobjdump.
 ///
 /// The fatbin container format is undocumented and can be compressed, so
 /// cuobjdump is used instead of a native parser.
-fn extract_cubins(lib: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
+fn extract(lib: &Path, kind: Kind, out_dir: &Path) -> Result<Vec<PathBuf>> {
+    let (flag, extension) = match kind {
+        Kind::Elf => ("-xelf", "cubin"),
+        Kind::Ptx => ("-xptx", "ptx"),
+    };
     let lib = std::fs::canonicalize(lib)?;
+    std::fs::create_dir(out_dir)?;
     let output = Command::new("cuobjdump")
-        .args(["-xelf", "all"])
+        .args([flag, "all"])
         .arg(&lib)
         .current_dir(out_dir)
         .output()
@@ -84,12 +128,12 @@ fn extract_cubins(lib: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut cubins: Vec<PathBuf> = std::fs::read_dir(out_dir)?
+    let mut files: Vec<PathBuf> = std::fs::read_dir(out_dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|ext| ext == "cubin"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == extension))
         .collect();
-    cubins.sort();
-    Ok(cubins)
+    files.sort();
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -102,15 +146,23 @@ mod tests {
         file
     }
 
+    fn format_of(bytes: &[u8]) -> Format {
+        detect(temp_file(bytes).path()).unwrap()
+    }
+
     #[test]
-    fn detects_cubin_by_elf_machine() {
+    fn detects_format_from_header() {
         let mut header = [0u8; 64];
         header[..4].copy_from_slice(b"\x7fELF");
         header[18..20].copy_from_slice(&190u16.to_le_bytes());
-        assert!(is_cubin(temp_file(&header).path()).unwrap());
+        assert_eq!(format_of(&header), Format::Cubin);
 
         header[18..20].copy_from_slice(&62u16.to_le_bytes()); // x86-64
-        assert!(!is_cubin(temp_file(&header).path()).unwrap());
-        assert!(!is_cubin(temp_file(b"short").path()).unwrap());
+        assert_eq!(format_of(&header), Format::Other);
+        assert_eq!(
+            format_of(b"!<arch>\n/               0           "),
+            Format::Archive
+        );
+        assert_eq!(format_of(b"short"), Format::Other);
     }
 }

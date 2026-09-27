@@ -19,3 +19,11 @@ template __global__ void scale_kernel<4096>(float*, const float*, float);
 template __global__ void scale_kernel<8192>(float*, const float*, float);
 
 extern "C" __global__ void plain_c_kernel(int* out) { out[threadIdx.x] = threadIdx.x; }
+
+// A dynamically indexed local array lives in local memory, giving the kernel
+// a non-zero stack frame
+__global__ void local_array_kernel(float* out, int n) {
+  float buf[64];
+  for (int i = 0; i < 64; ++i) buf[(i * 7 + n) % 64] = out[i];
+  out[threadIdx.x] = buf[n % 64] + buf[(n + threadIdx.x) % 64];
+}

@@ -1,11 +1,13 @@
+mod availability;
 mod cubin;
 mod demangle;
 mod extract;
+mod ptx;
 mod report;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -13,14 +15,16 @@ use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::RegexBuilder;
 
+use crate::availability::Device;
 use crate::cubin::CubinInfo;
-use crate::report::{Layout, Report};
+use crate::ptx::PtxInfo;
+use crate::report::{Layout, Report, SortKey};
 
 /// Size profiler for CUDA binaries: per-kernel code size by SM architecture.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Shared library or cubin to analyze
+    /// Shared library, object file, static archive or cubin to analyze
     file: PathBuf,
 
     /// Number of kernels to list in table output
@@ -34,6 +38,16 @@ struct Cli {
     /// Only include kernels whose name matches this regex (case-insensitive)
     #[arg(short = 'r', long, value_name = "REGEX")]
     filter: Option<String>,
+
+    /// Check which kernels load on this GPU (e.g. sm_103, 12.1) from a cubin,
+    /// need PTX JIT, or cannot run; repeatable. Considers every architecture
+    /// in the file regardless of --arch; --filter still applies
+    #[arg(short, long, value_name = "SM")]
+    device: Vec<Device>,
+
+    /// Order kernel lists by code size, registers or stack per thread
+    #[arg(short, long, value_enum, default_value_t = SortKey::Size)]
+    sort: SortKey,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
@@ -106,21 +120,19 @@ fn run(cli: &Cli) -> Result<()> {
         .transpose()
         .context("invalid --filter regex")?;
 
-    let found = extract::collect(&cli.file)?;
-    let mut cubins: Vec<CubinInfo> = found
-        .paths
-        .par_iter()
-        .filter_map(|path| {
-            cubin::analyze(path)
-                .inspect_err(|e| log::warn!("skipping {}: {e:#}", path.display()))
-                .ok()
-        })
-        .collect();
-    drop(found);
-    if cubins.is_empty() {
+    let code = extract::collect(&cli.file, !cli.device.is_empty())?;
+    let mut cubins: Vec<CubinInfo> = analyze_all(&code.cubins, cubin::analyze);
+    let mut ptx: Vec<PtxInfo> = analyze_all(&code.ptx, ptx::analyze);
+    drop(code);
+    // A PTX-only library still has something to report for --device
+    if cubins.is_empty() && ptx.is_empty() {
         bail!("no cubins could be analyzed in {}", cli.file.display());
     }
-    log::debug!("parsed {} cubin(s)", cubins.len());
+    log::debug!(
+        "parsed {} cubin(s), {} PTX file(s)",
+        cubins.len(),
+        ptx.len()
+    );
 
     if let Some(arch) = &cli.arch
         && !cubins.iter().any(|c| &c.arch == arch)
@@ -134,14 +146,16 @@ fn run(cli: &Cli) -> Result<()> {
         );
     }
 
-    demangle_kernels(&mut cubins);
+    demangle_kernels(&mut cubins, &mut ptx);
 
-    let report = Report::build(
+    let mut report = Report::build(
         cli.file.display().to_string(),
         &cubins,
         cli.arch.as_deref(),
         name_filter.as_ref(),
+        cli.sort,
     );
+    report.devices = availability::check(&cli.device, &cubins, &ptx, name_filter.as_ref());
     let mut out = io::stdout().lock();
     match cli.format {
         Format::Json => report.write_json(&mut out)?,
@@ -158,17 +172,34 @@ fn run(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Demangle kernel names once per unique symbol, in parallel.
-fn demangle_kernels(cubins: &mut [CubinInfo]) {
-    let unique: HashSet<&str> = cubins
-        .iter()
-        .flat_map(|c| c.kernels.iter().map(|(name, _)| name.as_str()))
-        .collect();
+/// Parse files in parallel, skipping (with a warning) those that fail.
+fn analyze_all<T: Send>(paths: &[PathBuf], analyze: fn(&Path) -> Result<T>) -> Vec<T> {
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            analyze(path)
+                .inspect_err(|e| log::warn!("skipping {}: {e:#}", path.display()))
+                .ok()
+        })
+        .collect()
+}
+
+/// Demangle kernel and PTX entry names once per unique symbol, in parallel.
+fn demangle_kernels(cubins: &mut [CubinInfo], ptx: &mut [PtxInfo]) {
+    let kernel_names = cubins.iter().flat_map(|c| &c.kernels).map(|k| &k.name);
+    let entry_names = ptx.iter().flat_map(|p| &p.entries);
+    let unique: HashSet<&String> = kernel_names.chain(entry_names).collect();
     let names: HashMap<String, String> = unique
         .into_par_iter()
-        .map(|name| (name.to_string(), demangle::kernel_name(name)))
+        .map(|name| (name.clone(), demangle::kernel_name(name)))
         .collect();
-    for (name, _) in cubins.iter_mut().flat_map(|c| &mut c.kernels) {
+
+    let kernel_names = cubins
+        .iter_mut()
+        .flat_map(|c| &mut c.kernels)
+        .map(|k| &mut k.name);
+    let entry_names = ptx.iter_mut().flat_map(|p| &mut p.entries);
+    for name in kernel_names.chain(entry_names) {
         if let Some(demangled) = names.get(name.as_str()) {
             name.clone_from(demangled);
         }

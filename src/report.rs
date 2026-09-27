@@ -11,7 +11,8 @@ use comfy_table::{
 use regex::Regex;
 use serde::Serialize;
 
-use crate::cubin::{CubinInfo, Sections};
+use crate::availability::{DeviceReport, Status};
+use crate::cubin::{CubinInfo, KernelInfo, Sections, Usage};
 
 /// Kernels listed in each per-architecture table.
 const PER_ARCH_TOP: usize = 15;
@@ -29,12 +30,67 @@ pub struct ArchSummary {
     pub total: u64,
 }
 
+/// A kernel's code size and resources on one architecture.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArchStats {
+    pub size: u64,
+    pub usage: Usage,
+}
+
+impl ArchStats {
+    /// Merge another copy of the kernel, e.g. from a second cubin of the
+    /// same architecture: sizes add up, resources take the larger value.
+    fn add(&mut self, kernel: &KernelInfo) {
+        self.size += kernel.size;
+        let (u, k) = (&mut self.usage, kernel.usage);
+        u.registers = u.registers.max(k.registers);
+        u.max_registers = u.max_registers.max(k.max_registers);
+        u.stack = u.stack.max(k.stack);
+        u.shared = u.shared.max(k.shared);
+    }
+}
+
 #[derive(Debug)]
 pub struct Kernel {
     pub name: String,
     /// Code bytes summed over all architectures.
     pub size: u64,
-    pub by_arch: BTreeMap<String, u64>,
+    pub by_arch: BTreeMap<String, ArchStats>,
+}
+
+/// What kernel lists are ordered by, largest first.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SortKey {
+    /// Code size
+    #[default]
+    Size,
+    /// Registers per thread
+    Regs,
+    /// Stack (local memory) per thread
+    Stack,
+}
+
+impl SortKey {
+    fn of(self, stats: &ArchStats) -> u64 {
+        match self {
+            Self::Size => stats.size,
+            Self::Regs => stats.usage.registers.unwrap_or(0).into(),
+            Self::Stack => stats.usage.stack.unwrap_or(0).into(),
+        }
+    }
+
+    /// Key across architectures: total size, or the largest resource value.
+    fn of_kernel(self, kernel: &Kernel) -> u64 {
+        match self {
+            Self::Size => kernel.size,
+            _ => kernel
+                .by_arch
+                .values()
+                .map(|s| self.of(s))
+                .max()
+                .unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,8 +98,14 @@ pub struct Report {
     pub file: String,
     pub sections: Sections,
     pub archs: Vec<ArchSummary>,
-    /// Sorted by size, largest first.
+    /// Ordered by `sort`, largest first.
     pub kernels: Vec<Kernel>,
+    /// Non-kernel functions, summed over cubins; not name-filtered.
+    pub device_functions: usize,
+    pub device_code: u64,
+    pub sort: SortKey,
+    /// Availability on the GPUs requested with `--device`.
+    pub devices: Vec<DeviceReport>,
 }
 
 impl Report {
@@ -53,24 +115,29 @@ impl Report {
         cubins: &[CubinInfo],
         arch: Option<&str>,
         name_filter: Option<&Regex>,
+        sort: SortKey,
     ) -> Self {
         let mut sections = Sections::default();
         let mut arch_sections: BTreeMap<&str, Sections> = BTreeMap::new();
-        let mut kernels: HashMap<&str, BTreeMap<String, u64>> = HashMap::new();
+        let mut kernels: HashMap<&str, BTreeMap<String, ArchStats>> = HashMap::new();
+        let (mut device_functions, mut device_code) = (0, 0);
 
         for cubin in cubins {
             if arch.is_some_and(|a| a != cubin.arch) {
                 continue;
             }
             sections += &cubin.sections;
+            device_functions += cubin.device_functions;
+            device_code += cubin.device_code;
             *arch_sections.entry(&cubin.arch).or_default() += &cubin.sections;
-            for (name, size) in &cubin.kernels {
-                if name_filter.is_none_or(|re| re.is_match(name)) {
-                    *kernels
-                        .entry(name)
+            for kernel in &cubin.kernels {
+                if name_filter.is_none_or(|re| re.is_match(&kernel.name)) {
+                    kernels
+                        .entry(&kernel.name)
                         .or_default()
                         .entry(cubin.arch.clone())
-                        .or_default() += size;
+                        .or_default()
+                        .add(kernel);
                 }
             }
         }
@@ -78,7 +145,9 @@ impl Report {
         let archs = arch_sections
             .into_iter()
             .map(|(arch, secs)| {
-                let sizes = kernels.values().filter_map(|by_arch| by_arch.get(arch));
+                let sizes = kernels
+                    .values()
+                    .filter_map(|by_arch| Some(by_arch.get(arch)?.size));
                 ArchSummary {
                     arch: arch.to_string(),
                     kernels: sizes.clone().count(),
@@ -92,17 +161,25 @@ impl Report {
             .into_iter()
             .map(|(name, by_arch)| Kernel {
                 name: name.to_string(),
-                size: by_arch.values().sum(),
+                size: by_arch.values().map(|s| s.size).sum(),
                 by_arch,
             })
             .collect();
-        kernels.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+        kernels.sort_by(|a, b| {
+            (sort.of_kernel(b), b.size)
+                .cmp(&(sort.of_kernel(a), a.size))
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
         Report {
             file,
             sections,
             archs,
             kernels,
+            device_functions,
+            device_code,
+            sort,
+            devices: Vec::new(),
         }
     }
 
@@ -120,6 +197,9 @@ impl Report {
             kernel_code_size: kernel_code,
             kernel_code_size_human: human_size(kernel_code),
             kernel_count: self.kernels.len(),
+            device_function_count: self.device_functions,
+            device_function_code_size: self.device_code,
+            device_function_code_size_human: human_size(self.device_code),
             architectures: self
                 .archs
                 .iter()
@@ -155,11 +235,38 @@ impl Report {
                     by_arch: k
                         .by_arch
                         .iter()
-                        .map(|(arch, &size)| {
-                            let size_human = human_size(size);
-                            (arch.as_str(), JsonSize { size, size_human })
+                        .map(|(arch, stats)| {
+                            let json = JsonArchStats {
+                                size: stats.size,
+                                size_human: human_size(stats.size),
+                                registers: stats.usage.registers,
+                                max_registers: stats.usage.max_registers,
+                                stack: stats.usage.stack,
+                                likely_spill: stats.usage.likely_spills(),
+                                static_shared: stats.usage.shared,
+                            };
+                            (arch.as_str(), json)
                         })
                         .collect(),
+                })
+                .collect(),
+            devices: self
+                .devices
+                .iter()
+                .map(|d| {
+                    let kernels = |status: Status| {
+                        d.problems
+                            .iter()
+                            .filter(|(s, ..)| *s == status)
+                            .map(|(_, name, _)| name.as_str())
+                            .collect()
+                    };
+                    JsonDevice {
+                        device: d.device.to_string(),
+                        cubin_kernel_count: d.cubin,
+                        ptx_jit: kernels(Status::PtxJit),
+                        missing: kernels(Status::Missing),
+                    }
                 })
                 .collect(),
         };
@@ -201,7 +308,16 @@ impl Report {
             .map(|text| Cell::new(text).add_attribute(Attribute::Bold)),
         );
         let heading = format!("Architectures: {}", self.file);
-        writeln!(out, "{}\n{table}\n", layout.title(&heading))?;
+        writeln!(out, "{}\n{table}", layout.title(&heading))?;
+        if self.device_functions > 0 {
+            writeln!(
+                out,
+                "Not in kernel lists: {} device functions with their own symbols, {}",
+                self.device_functions,
+                human_size(self.device_code)
+            )?;
+        }
+        writeln!(out)?;
 
         let mut table = new_table(layout, &[Label("Section"), Num("Size"), Num("%")]);
         for (kind, size) in self.sections.ranked() {
@@ -213,13 +329,17 @@ impl Report {
         }
         writeln!(out, "{}\n{table}\n", layout.title("Sections"))?;
 
+        // With a single architecture, resources are unambiguous and the
+        // arch count is always 1, so show the former instead of the latter
+        let single_arch = self.archs.len() == 1;
         let rows: Vec<KernelRow> = self
             .kernels
             .iter()
             .map(|k| KernelRow {
                 name: &k.name,
                 size: k.size,
-                archs: Some(k.by_arch.len()),
+                archs: (!single_arch).then_some(k.by_arch.len()),
+                usage: single_arch.then(|| k.by_arch.values().next().unwrap().usage),
             })
             .collect();
         let shown = top.min(rows.len());
@@ -232,24 +352,77 @@ impl Report {
                 let mut rows: Vec<KernelRow> = self
                     .kernels
                     .iter()
-                    .filter_map(|k| {
-                        Some(KernelRow {
-                            name: &k.name,
-                            size: *k.by_arch.get(&arch.arch)?,
-                            archs: None,
-                        })
+                    .filter_map(|k| Some((k.name.as_str(), *k.by_arch.get(&arch.arch)?)))
+                    .map(|(name, stats)| KernelRow {
+                        name,
+                        size: stats.size,
+                        archs: None,
+                        usage: Some(stats.usage),
                     })
                     .collect();
-                // Kernels are ranked by their total size; re-rank for this arch
-                rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(b.name)));
+                // Kernels are ranked across architectures; re-rank for this one
+                let key = |r: &KernelRow| {
+                    let stats = ArchStats {
+                        size: r.size,
+                        usage: r.usage.unwrap_or_default(),
+                    };
+                    (self.sort.of(&stats), r.size)
+                };
+                rows.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(b.name)));
                 let shown = PER_ARCH_TOP.min(rows.len());
                 let heading = format!("Top kernels for {} ({shown} of {})", arch.arch, rows.len());
                 let table = kernel_table(layout, &rows, shown, arch.code);
                 writeln!(out, "\n{}\n{table}", layout.title(&heading))?;
             }
         }
+
+        for device in &self.devices {
+            write_device(out, device, top, layout)?;
+        }
         Ok(())
     }
+}
+
+fn write_device(
+    out: &mut impl Write,
+    device: &DeviceReport,
+    top: usize,
+    layout: Layout,
+) -> io::Result<()> {
+    let count = |status| {
+        device
+            .problems
+            .iter()
+            .filter(|(s, ..)| *s == status)
+            .count()
+    };
+    let heading = format!(
+        "Availability on {}: {} from cubin, {} need PTX JIT, {} missing",
+        device.device,
+        device.cubin,
+        count(Status::PtxJit),
+        count(Status::Missing),
+    );
+    writeln!(out, "\n{}", layout.title(&heading))?;
+    if device.problems.is_empty() {
+        return Ok(());
+    }
+
+    let mut table = new_table(layout, &[Label("Status"), Label("Kernel"), Num("Size")]);
+    layout.fit_names(&mut table, 1);
+    let shown = top.min(device.problems.len());
+    for (status, name, size) in &device.problems[..shown] {
+        let status = match status {
+            Status::Missing => Cell::new("missing")
+                .fg(Color::DarkRed)
+                .add_attribute(Attribute::Bold),
+            Status::PtxJit => Cell::new("PTX JIT").fg(Color::DarkYellow),
+        };
+        let name = label_cell(layout.name(name));
+        table.add_row(one_line_row(vec![status, name, size_cell(*size)]));
+    }
+    add_overflow_row(&mut table, device.problems.len() - shown);
+    writeln!(out, "{table}")
 }
 
 /// How table output is rendered.
@@ -269,6 +442,37 @@ impl Layout {
             text.to_string()
         }
     }
+
+    /// Whether names are fitted to the terminal width by comfy-table.
+    fn fits_terminal(&self) -> bool {
+        self.width.is_some() && !self.full_names
+    }
+
+    /// In a terminal, let only the name column shrink so each row fits on
+    /// one line.
+    fn fit_names(&self, table: &mut Table, name_column: usize) {
+        let Some(width) = self.width.filter(|_| !self.full_names) else {
+            return;
+        };
+        table
+            .set_width(width)
+            .set_content_arrangement(ContentArrangement::Dynamic);
+        for (i, column) in table.column_iter_mut().enumerate() {
+            if i != name_column {
+                column.set_constraint(ColumnConstraint::ContentWidth);
+            }
+        }
+    }
+
+    /// A kernel name as displayed: whole, left to the terminal fitting, or
+    /// truncated to a fixed length when there is no terminal.
+    fn name(&self, name: &str) -> String {
+        if self.full_names || self.fits_terminal() {
+            name.to_string()
+        } else {
+            truncate(name, DEFAULT_NAME_WIDTH)
+        }
+    }
 }
 
 struct KernelRow<'a> {
@@ -276,56 +480,55 @@ struct KernelRow<'a> {
     size: u64,
     /// Number of architectures, shown only in the cross-arch table.
     archs: Option<usize>,
+    /// Resources, shown only in per-architecture tables.
+    usage: Option<Usage>,
 }
 
 /// Table of the first `shown` rows, with sizes as a share of `whole`.
 fn kernel_table(layout: Layout, rows: &[KernelRow], shown: usize, whole: u64) -> Table {
     let show_archs = rows.iter().any(|r| r.archs.is_some());
+    let show_usage = rows.iter().any(|r| r.usage.is_some());
     let mut columns = vec![Num("#"), Label("Kernel")];
     if show_archs {
         columns.push(Num("Archs"));
     }
     columns.extend([Num("Size"), Num("% of code")]);
-    let mut table = new_table(layout, &columns);
-
-    // In a terminal, shrink only the name column so each kernel fits on one
-    // line; otherwise truncate names to a fixed length
-    let fit_width = layout.width.filter(|_| !layout.full_names);
-    if let Some(width) = fit_width {
-        table
-            .set_width(width)
-            .set_content_arrangement(ContentArrangement::Dynamic);
-        for (i, column) in table.column_iter_mut().enumerate() {
-            if i != 1 {
-                column.set_constraint(ColumnConstraint::ContentWidth);
-            }
-        }
+    if show_usage {
+        columns.extend([Num("Regs"), Num("Stack"), Num("Shared")]);
     }
+    let mut table = new_table(layout, &columns);
+    layout.fit_names(&mut table, 1);
 
     for (rank, row) in rows[..shown].iter().enumerate() {
-        let name = if layout.full_names || fit_width.is_some() {
-            row.name.to_string()
-        } else {
-            truncate(row.name, DEFAULT_NAME_WIDTH)
-        };
         let mut cells = vec![
             Cell::new(rank + 1).add_attribute(Attribute::Dim),
-            label_cell(name),
+            label_cell(layout.name(row.name)),
         ];
         cells.extend(row.archs.map(count_cell));
         cells.extend([size_cell(row.size), percent_cell(row.size, whole)]);
-        let mut row = Row::from(cells);
-        row.max_height(1);
-        table.add_row(row);
+        if let Some(usage) = row.usage {
+            cells.extend(usage_cells(usage));
+        }
+        table.add_row(one_line_row(cells));
     }
-    if shown < rows.len() {
+    add_overflow_row(&mut table, rows.len() - shown);
+    table
+}
+
+fn one_line_row(cells: Vec<Cell>) -> Row {
+    let mut row = Row::from(cells);
+    row.max_height(1);
+    row
+}
+
+/// Note the kernels left out of a table, if any.
+fn add_overflow_row(table: &mut Table, hidden: usize) {
+    if hidden > 0 {
         table.add_row(vec![
             Cell::new("..."),
-            Cell::new(format!("({} more kernels)", rows.len() - shown))
-                .add_attribute(Attribute::Dim),
+            Cell::new(format!("({hidden} more kernels)")).add_attribute(Attribute::Dim),
         ]);
     }
-    table
 }
 
 enum Column {
@@ -375,6 +578,23 @@ fn size_cell(bytes: u64) -> Cell {
         .add_attribute(Attribute::Bold)
 }
 
+/// Registers, stack and static shared memory. The stack is highlighted when
+/// the kernel most likely spills, i.e. its registers are at the limit.
+fn usage_cells(usage: Usage) -> [Cell; 3] {
+    let optional = |value: Option<String>| value.unwrap_or_else(|| "-".into());
+    let stack = Cell::new(optional(usage.stack.map(|b| human_size(b.into()))));
+    let stack = if usage.likely_spills() {
+        stack.fg(Color::DarkRed).add_attribute(Attribute::Bold)
+    } else {
+        stack
+    };
+    [
+        Cell::new(optional(usage.registers.map(|r| r.to_string()))),
+        stack,
+        Cell::new(human_size(usage.shared)),
+    ]
+}
+
 fn percent_cell(part: u64, whole: u64) -> Cell {
     Cell::new(format_percent(part, whole)).fg(Color::DarkGreen)
 }
@@ -387,9 +607,26 @@ struct JsonReport<'a> {
     kernel_code_size: u64,
     kernel_code_size_human: String,
     kernel_count: usize,
+    /// Functions that are not kernels, e.g. device functions in -rdc builds.
+    device_function_count: usize,
+    device_function_code_size: u64,
+    device_function_code_size_human: String,
     architectures: Vec<JsonArch<'a>>,
     sections: Vec<JsonSection>,
     kernels: Vec<JsonKernel<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    devices: Vec<JsonDevice<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonDevice<'a> {
+    device: String,
+    /// Kernels with a cubin that loads on the device.
+    cubin_kernel_count: usize,
+    /// Kernels that only run after JIT-compiling their PTX.
+    ptx_jit: Vec<&'a str>,
+    /// Kernels with no code that can run on the device.
+    missing: Vec<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -419,13 +656,24 @@ struct JsonKernel<'a> {
     size_human: String,
     /// Share of all kernel code.
     percent: f64,
-    by_arch: BTreeMap<&'a str, JsonSize>,
+    by_arch: BTreeMap<&'a str, JsonArchStats>,
 }
 
 #[derive(Serialize)]
-struct JsonSize {
+struct JsonArchStats {
     size: u64,
     size_human: String,
+    /// Per thread.
+    registers: Option<u32>,
+    /// Per-thread register limit set at compile time.
+    max_registers: Option<u32>,
+    /// Local memory per thread, in bytes: spills, local arrays or calls.
+    stack: Option<u32>,
+    /// Registers at the limit with a non-zero stack.
+    likely_spill: bool,
+    /// Shared memory per block allocated at compile time, in bytes,
+    /// including any system reservation; excludes dynamic shared memory.
+    static_shared: u64,
 }
 
 fn human_size(bytes: u64) -> String {
@@ -467,8 +715,16 @@ mod tests {
         sections.add(SectionKind::Metadata, 10);
         CubinInfo {
             arch: arch.into(),
-            kernels: kernels.iter().map(|&(n, s)| (n.to_string(), s)).collect(),
+            kernels: kernels
+                .iter()
+                .map(|&(name, size)| KernelInfo {
+                    name: name.to_string(),
+                    size,
+                    usage: Usage::default(),
+                })
+                .collect(),
             sections,
+            ..Default::default()
         }
     }
 
@@ -482,7 +738,7 @@ mod tests {
 
     #[test]
     fn merges_kernels_across_archs() {
-        let report = Report::build("lib.so".into(), &sample(), None, None);
+        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
         let names: Vec<_> = report
             .kernels
             .iter()
@@ -501,7 +757,13 @@ mod tests {
     #[test]
     fn arch_and_name_filters() {
         let re = Regex::new("(?i)GEMM").unwrap();
-        let report = Report::build("lib.so".into(), &sample(), Some("sm_100"), Some(&re));
+        let report = Report::build(
+            "lib.so".into(),
+            &sample(),
+            Some("sm_100"),
+            Some(&re),
+            SortKey::Size,
+        );
         assert_eq!(report.kernels.len(), 1);
         assert_eq!(report.kernels[0].size, 200);
         // Section totals ignore the name filter but honor the arch filter
@@ -511,7 +773,7 @@ mod tests {
 
     #[test]
     fn json_has_raw_and_human_sizes() {
-        let report = Report::build("lib.so".into(), &sample(), None, None);
+        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
         let mut buf = Vec::new();
         report.write_json(&mut buf).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -525,7 +787,7 @@ mod tests {
 
     #[test]
     fn tables_render_per_arch_breakdown() {
-        let report = Report::build("lib.so".into(), &sample(), None, None);
+        let report = Report::build("lib.so".into(), &sample(), None, None, SortKey::Size);
         let layout = Layout {
             color: false,
             full_names: false,
