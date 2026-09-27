@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # stable and the rust-version declared in Cargo.toml
+        toolchain: [stable, "1.88"]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Fail instead of skipping the tests that compile CUDA fixtures
+      CUHEFT_REQUIRE_CUDA: 1
+      CUDA_VERSION: "13-1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nvcc and cuobjdump
+        # Only the two components from NVIDIA's apt repository, not the whole
+        # toolkit. Works on both x86_64 and arm64 (sbsa) runners.
+        run: |
+          arch=$([ "$(uname -m)" = aarch64 ] && echo sbsa || echo x86_64)
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/$arch/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            "cuda-nvcc-$CUDA_VERSION" "cuda-cuobjdump-$CUDA_VERSION"
+          echo "/usr/local/cuda-${CUDA_VERSION/-/.}/bin" >> "$GITHUB_PATH"
+      - run: nvcc --version && cuobjdump --version
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
