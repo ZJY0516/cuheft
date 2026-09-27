@@ -418,7 +418,7 @@ fn write_device(
                 .add_attribute(Attribute::Bold),
             Status::PtxJit => Cell::new("PTX JIT").fg(Color::DarkYellow),
         };
-        let name = label_cell(layout.name(name));
+        let name = name_cell(layout.name(name));
         table.add_row(one_line_row(vec![status, name, size_cell(*size)]));
     }
     add_overflow_row(&mut table, device.problems.len() - shown);
@@ -502,7 +502,7 @@ fn kernel_table(layout: Layout, rows: &[KernelRow], shown: usize, whole: u64) ->
     for (rank, row) in rows[..shown].iter().enumerate() {
         let mut cells = vec![
             Cell::new(rank + 1).add_attribute(Attribute::Dim),
-            label_cell(layout.name(row.name)),
+            name_cell(layout.name(row.name)),
         ];
         cells.extend(row.archs.map(count_cell));
         cells.extend([size_cell(row.size), percent_cell(row.size, whole)]);
@@ -566,6 +566,12 @@ fn new_table(layout: Layout, columns: &[Column]) -> Table {
 
 fn label_cell(text: impl ToString) -> Cell {
     Cell::new(text).fg(Color::DarkCyan)
+}
+
+/// A kernel name. When fitted to the terminal it is cut at the column width
+/// rather than at the first space that does not fit, as for normal text.
+fn name_cell(name: String) -> Cell {
+    label_cell(name).set_delimiter('\0')
 }
 
 fn count_cell(count: usize) -> Cell {

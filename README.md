@@ -1,8 +1,9 @@
 # cuheft
 
 Shows how much space each CUDA kernel takes in a `.so`, `.o`, `.a` or
-`.cubin`, per SM architecture. Useful when a wheel gets too big and you want to know which
-kernels and which `TORCH_CUDA_ARCH_LIST` entries are responsible.
+`.cubin`, per SM architecture, along with its registers, stack and shared
+memory. Useful when a wheel gets too big and you want to know which kernels
+and which `TORCH_CUDA_ARCH_LIST` entries are responsible.
 
 It also catches build problems that are easy to miss: kernels a given GPU
 cannot load (a `sm_100a`-only kernel on a GB300, say), kernels that are only
@@ -26,15 +27,18 @@ cuheft libfoo.so                 # top 30 kernels
 cuheft libfoo.so -n 100          # top 100
 cuheft libfoo.so -a sm_90a       # one architecture only
 cuheft libfoo.so -r 'gemm|attn'  # regex on kernel names, case-insensitive
-cuheft foo.sm_100f.cubin
+cuheft foo.sm_100f.cubin         # also .o and .a files
+cuheft libfoo.so --full-names    # do not shorten kernel names
 cuheft libfoo.so -f json | jq '.kernels[:5]'
 
-cuheft libfoo.so -d sm_103 -d 12.1    # what GB300 and DGX Spark can load
-cuheft libfoo.so -a sm_90a -s stack   # kernels using local memory first
-cuheft libfoo.so -a sm_90a -s regs    # highest register counts first
+cuheft libfoo.so -d sm_103           # what a GB300 (sm_103) can load
+cuheft libfoo.so -d 12.1             # same for DGX Spark (sm_121)
+cuheft libfoo.so -a sm_90a -s stack  # kernels using local memory first
+cuheft libfoo.so -a sm_90a -s regs   # highest register counts first
 ```
 
-Output for vLLM's MoE extension (trimmed):
+`cuheft _moe_C_stable_libtorch.abi3.so -n 3 -d sm_103` on vLLM's MoE
+extension, in a 90-column terminal (trimmed):
 
 ```
 Architectures: _moe_C_stable_libtorch.abi3.so
@@ -59,19 +63,54 @@ Sections
 │ Data              ┆   8.7 MiB ┆  2.0% │
 │ Debug Info        ┆   4.1 MiB ┆  0.9% │
 ╰───────────────────┴───────────┴───────╯
+
+Top kernels (3 of 2445)
+╭─────┬──────────────────────────────────────────────────┬───────┬───────────┬───────────╮
+│   # ┆ Kernel                                           ┆ Archs ┆      Size ┆ % of code │
+╞═════╪══════════════════════════════════════════════════╪═══════╪═══════════╪═══════════╡
+│   1 ┆ vllm::moe::single_group_topk::detail::single_gr… ┆     7 ┆ 540.8 KiB ┆      0.2% │
+│   2 ┆ vllm::moe::single_group_topk::detail::single_gr… ┆     7 ┆ 540.8 KiB ┆      0.2% │
+│   3 ┆ vllm::moe::single_group_topk::detail::single_gr… ┆     7 ┆ 540.8 KiB ┆      0.2% │
+│ ... ┆ (2442 more kernels)                              ┆       ┆           ┆           │
+╰─────┴──────────────────────────────────────────────────┴───────┴───────────┴───────────╯
+
+Top kernels for sm_100 (15 of 1568)
+╭─────┬──────────────────────────────────┬──────────┬───────────┬──────┬───────┬─────────╮
+│   # ┆ Kernel                           ┆     Size ┆ % of code ┆ Regs ┆ Stack ┆  Shared │
+╞═════╪══════════════════════════════════╪══════════╪═══════════╪══════╪═══════╪═════════╡
+│   1 ┆ vllm::moe::single_group_topk::d… ┆ 67.1 KiB ┆      0.2% ┆  126 ┆   0 B ┆ 1.0 KiB │
+│   2 ┆ vllm::moe::single_group_topk::d… ┆ 67.1 KiB ┆      0.2% ┆  126 ┆   0 B ┆ 1.0 KiB │
+│   3 ┆ vllm::moe::single_group_topk::d… ┆ 67.1 KiB ┆      0.2% ┆  126 ┆   0 B ┆ 1.0 KiB │
+│ ... ┆ (1553 more kernels)              ┆          ┆           ┆      ┆       ┆         │
+╰─────┴──────────────────────────────────┴──────────┴───────────┴──────┴───────┴─────────╯
+
+...
+
+Availability on sm_103: 1568 from cubin, 673 need PTX JIT, 204 missing
+╭─────────┬──────────────────────────────────────────────────────────────────┬───────────╮
+│ Status  ┆ Kernel                                                           ┆      Size │
+╞═════════╪══════════════════════════════════════════════════════════════════╪═══════════╡
+│ missing ┆ marlin_moe_wna16::Marlin<(long)2814749767172868, (long)11258999… ┆ 229.0 KiB │
+│ missing ┆ marlin_moe_wna16::Marlin<(long)2814749767172868, (long)11258999… ┆ 224.6 KiB │
+│ missing ┆ marlin_moe_wna16::Marlin<(long)2814749767172868, (long)11258999… ┆ 223.6 KiB │
+│ ...     ┆ (874 more kernels)                                               ┆           │
+╰─────────┴──────────────────────────────────────────────────────────────────┴───────────╯
 ```
 
-After these come the largest kernels overall and the largest kernels for each
-architecture. `Code` is the kernels' SASS; `Total` also counts metadata,
-constant banks and so on. Per-architecture tables, and the main table when
-only one architecture is shown, add registers per thread, stack (local
-memory) per thread and compile-time shared memory per block. A stack comes
-from spills, local arrays or calls to non-inlined functions. It is
-highlighted only when the kernel also uses every register it is allowed
-(the `__launch_bounds__` or `-maxrregcount` limit), which usually means
-spills. The binary does not record actual spill counts, so check those with
-`ptxas -v` or Nsight Compute. JSON output lists every kernel with its size
-and resources per architecture.
+`Code` is the kernels' SASS; `Total` also counts metadata, constant banks
+and so on. The kernel tables list the `-n` largest kernels overall, then the
+15 largest for each architecture. Names are shortened to fit the terminal,
+or to 100 characters when output is not a terminal.
+
+The per-architecture tables, and the main table when only one architecture
+is shown, add registers per thread, stack (local memory) per thread and
+compile-time shared memory per block. A stack comes from spills, local
+arrays or calls to non-inlined functions. It is highlighted only when the
+kernel also uses every register it is allowed (the `__launch_bounds__` or
+`-maxrregcount` limit), which usually means spills. The binary does not
+record actual spill counts, so check those with `ptxas -v` or Nsight
+Compute. JSON output lists every kernel with its size and resources per
+architecture.
 
 With `--device`, each kernel is checked against CUDA's loading rules: a cubin
 runs on the same major version with an equal or newer minor (`sm_100` and
@@ -83,7 +122,8 @@ narrows what is displayed; `--filter` does limit which kernels are checked.
 
 ## Notes
 
-- Cubins are extracted with `cuobjdump -xelf all`. The fatbin container is
+- Cubins are extracted with `cuobjdump -xelf all`, and PTX with
+  `cuobjdump -xptx all` when `--device` is given. The fatbin container is
   undocumented and can be compressed, so there is no native parser for it.
 - cuobjdump names an `sm_100f` cubin `*.sm_100.cubin`. The real target is
   read from the ptxas command line stored in each cubin.
